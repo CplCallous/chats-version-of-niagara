@@ -1,0 +1,137 @@
+
+name: Build and Verify NiagaraReplica APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**.gradle'
+      - '**.gradle.kts'
+      - '**.kt'
+      - '**.java'
+      - '**.xml'
+      - '**.properties'
+      - 'gradle/**'
+      - 'gradlew'
+      - 'gradlew.bat'
+      - '.github/workflows/build.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, verify and publish APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager --install \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "platform-tools"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Check project files
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f settings.gradle || test -f settings.gradle.kts
+          test -f app/build.gradle || test -f app/build.gradle.kts
+          echo "Project structure check passed."
+
+      - name: Build release APK
+        id: build_apk
+        shell: bash
+        run: |
+          set -o pipefail
+          gradle --no-daemon --stacktrace assembleRelease \
+            2>&1 | tee "$RUNNER_TEMP/build.log"
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          test -s "$APK" || {
+            echo "::error::Release APK was not produced."
+            find app/build/outputs -maxdepth 5 -type f -print || true
+            exit 1
+          }
+
+          BUILD_TOOLS="$ANDROID_HOME/build-tools/35.0.0"
+
+          "$BUILD_TOOLS/zipalign" -c -v 4 "$APK"
+          unzip -t "$APK" >/dev/null
+          unzip -Z1 "$APK" | grep -Eq '^classes([0-9]+)?\.dex$'
+
+          mkdir -p "$RUNNER_TEMP/signed"
+
+          keytool -genkeypair -noprompt \
+            -keystore "$RUNNER_TEMP/launcher.keystore" \
+            -storepass launcherpass \
+            -keypass launcherpass \
+            -alias launcher \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000 \
+            -dname "CN=NiagaraReplica CI,O=Android Build,C=IN"
+
+          "$BUILD_TOOLS/zipalign" -f 4 \
+            "$APK" "$RUNNER_TEMP/signed/aligned.apk"
+
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks "$RUNNER_TEMP/launcher.keystore" \
+            --ks-key-alias launcher \
+            --ks-pass pass:launcherpass \
+            --key-pass pass:launcherpass \
+            --out "$RUNNER_TEMP/signed/NiagaraReplica.apk" \
+            "$RUNNER_TEMP/signed/aligned.apk"
+
+          "$BUILD_TOOLS/apksigner" verify --verbose \
+            "$RUNNER_TEMP/signed/NiagaraReplica.apk"
+
+          test -s "$RUNNER_TEMP/signed/NiagaraReplica.apk"
+          echo "APK build and verification passed."
+
+      - name: Upload APK artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NiagaraReplica-APK
+          path: ${{ runner.temp }}/signed/NiagaraReplica.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NiagaraReplica-build-logs
+          path: |
+            ${{ runner.temp }}/build.log
+            app/build/outputs/logs/
+          if-no-files-found: warn
+          retention-days: 14
